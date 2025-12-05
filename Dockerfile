@@ -1,5 +1,6 @@
 # --- Stage 1: Build the Custom Binary ---
-FROM golang:1.23-bookworm AS builder
+# CHANGE: Upgraded to golang:1.25 to support the 'tool' directive
+FROM golang:1.25-bookworm AS builder
 
 WORKDIR /app
 
@@ -9,24 +10,20 @@ RUN apt-get update && apt-get install -y unzip
 # 1. Copy source code
 COPY . .
 
-# 2. Download and Extract the UI Assets (Crucial Step!)
-# We fetch the latest pre-built UI from the official repo so we don't have to build it ourselves
+# 2. Download and Extract the UI Assets
+# This prevents the "blank screen" issue by fetching the frontend code
 ADD https://github.com/tgdrive/teldrive-ui/releases/download/latest/teldrive-ui.zip /tmp/ui.zip
 RUN unzip /tmp/ui.zip -d ui/dist
 
 # 3. Build the Go Binary
-# We disable CGO to make a static binary that works everywhere
 ENV CGO_ENABLED=0
 # -ldflags="-s -w" makes the binary smaller
 RUN go build -ldflags="-s -w" -o teldrive main.go
 
 # --- Stage 2: Create the Running Container ---
-# We use 'debian:bookworm-slim' instead of 'scratch' so we have a shell for our script
 FROM debian:bookworm-slim
 
 # Install necessary runtime tools
-# ca-certificates: Needed to talk to Telegram HTTPS API
-# gettext-base: Needed for 'envsubst' to replace secrets
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     gettext-base \
