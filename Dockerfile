@@ -49,7 +49,7 @@ prepare-stmt = false\n\
 \n\
 [jwt]\n\
 secret = "${JWT_SECRET}"\n\
-allowed-users = [ "${ALLOWED_USER}" ]\n\
+allowed-users = "${ALLOWED_USER}"\n\
 \n\
 [tg.uploads]\n\
 encryption-key = "${ENCRYPTION_KEY}"\n\
