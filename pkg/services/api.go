@@ -2,7 +2,9 @@ package services
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -28,10 +30,18 @@ type apiService struct {
 	db             *gorm.DB
 	cnf            *config.ServerCmdConfig
 	cache          cache.Cacher
-	worker         *tgc.BotWorker
-	middlewares    []telegram.Middleware
-	events         *events.Recorder
+	botSelector    tgc.BotSelector
+	events         events.EventBroadcaster
 	channelManager *tgc.ChannelManager
+}
+
+func (a *apiService) newMiddlewares(ctx context.Context, retries int) []telegram.Middleware {
+	return tgc.NewMiddleware(&a.cnf.TG,
+		tgc.WithFloodWait(),
+		tgc.WithRecovery(ctx),
+		tgc.WithRetry(retries),
+		tgc.WithRateLimit(),
+	)
 }
 
 func (a *apiService) VersionVersion(ctx context.Context) (*api.ApiVersion, error) {
@@ -60,6 +70,79 @@ func (a *apiService) EventsGetEvents(ctx context.Context) ([]api.Event, error) {
 	}), nil
 }
 
+func (a *apiService) EventsEventsStream(ctx context.Context, params api.EventsEventsStreamParams) (*api.EventsEventsStreamOKHeaders, error) {
+	return nil, nil
+}
+
+func (e *extendedService) EventsEventsStream(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	cookie, err := r.Cookie(authCookieName)
+	if err != nil {
+		http.Error(w, "missing token or authash", http.StatusUnauthorized)
+		return
+	}
+	user, err := auth.VerifyUser(r.Context(), e.api.db, e.api.cache, e.api.cnf.JWT.Secret, cookie.Value)
+	if err != nil {
+		http.Error(w, "invalid token", http.StatusUnauthorized)
+		return
+	}
+	userId, _ := strconv.ParseInt(user.Subject, 10, 64)
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	eventChan := e.api.events.Subscribe(userId)
+	defer e.api.events.Unsubscribe(userId, eventChan)
+	fmt.Fprintf(w, ": connected\n\n")
+	flusher.Flush()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-eventChan:
+			if !ok {
+				return
+			}
+			src := event.Source.Data()
+			if src == nil {
+				continue
+			}
+			eventData := api.Event{
+				ID:        event.ID,
+				Type:      event.Type,
+				CreatedAt: event.CreatedAt,
+				Source: api.Source{
+					ID:           src.ID,
+					Type:         api.SourceType(src.Type),
+					Name:         src.Name,
+					ParentId:     src.ParentID,
+					DestParentId: api.NewOptString(src.DestParentID),
+				},
+			}
+
+			jsonData, _ := eventData.MarshalJSON()
+			fmt.Fprintf(w, "data: %s\n\n", jsonData)
+			flusher.Flush()
+
+		case <-ticker.C:
+			fmt.Fprintf(w, ": keepalive\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
 func (a *apiService) NewError(ctx context.Context, err error) *api.ErrorStatusCode {
 	var (
 		code     = http.StatusInternalServerError
@@ -82,7 +165,8 @@ func (a *apiService) NewError(ctx context.Context, err error) *api.ErrorStatusCo
 			code = apiError.code
 			message = apiError.Error()
 		}
-		logging.FromContext(ctx).Error("api error", zap.Error(apiError.err))
+		logger := logging.Component("API")
+		logger.Error("request.failed", zap.Error(apiError.err))
 	}
 	return &api.ErrorStatusCode{StatusCode: code, Response: api.Error{Code: code, Message: message}}
 }
@@ -90,19 +174,16 @@ func (a *apiService) NewError(ctx context.Context, err error) *api.ErrorStatusCo
 func NewApiService(db *gorm.DB,
 	cnf *config.ServerCmdConfig,
 	cache cache.Cacher,
-	worker *tgc.BotWorker,
-	events *events.Recorder) *apiService {
-
-	middlewares := tgc.NewMiddleware(&cnf.TG, tgc.WithFloodWait(), tgc.WithRateLimit(), tgc.WithRetry(5))
+	botSelector tgc.BotSelector,
+	events events.EventBroadcaster) *apiService {
 
 	return &apiService{
 		db:             db,
 		cnf:            cnf,
 		cache:          cache,
-		worker:         worker,
-		middlewares:    middlewares,
+		botSelector:    botSelector,
 		events:         events,
-		channelManager: tgc.NewChannelManager(db, cache, &cnf.TG, middlewares),
+		channelManager: tgc.NewChannelManager(db, cache, &cnf.TG),
 	}
 }
 
@@ -136,6 +217,10 @@ func (m *extendedMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case api.SharesStreamOperation:
 		args := route.Args()
 		m.srv.SharesStream(w, r, args[0], args[1])
+		return
+
+	case api.EventsEventsStreamOperation:
+		m.srv.EventsEventsStream(w, r)
 		return
 	}
 	m.next.ServeHTTP(w, r)

@@ -96,7 +96,7 @@ func (a *apiService) AuthLogin(ctx context.Context, session *api.SessionCreate) 
 	if err != nil {
 		return nil, &apiError{err: err}
 	}
-	client, err := tgc.AuthClient(ctx, &a.cnf.TG, session.Session, a.middlewares...)
+	client, err := tgc.AuthClient(ctx, &a.cnf.TG, session.Session, a.newMiddlewares(ctx, 5)...)
 	if err != nil {
 		return nil, &apiError{err: err}
 	}
@@ -130,13 +130,14 @@ func (a *apiService) AuthLogin(ctx context.Context, session *api.SessionCreate) 
 
 func (a *apiService) AuthLogout(ctx context.Context) (*api.AuthLogoutNoContent, error) {
 	authUser := auth.GetJWTUser(ctx)
-	client, _ := tgc.AuthClient(ctx, &a.cnf.TG, authUser.TgSession, a.middlewares...)
-	_ = tgc.RunWithAuth(ctx, client, "", func(ctx context.Context) error {
+	client, _ := tgc.AuthClient(ctx, &a.cnf.TG, authUser.TgSession, a.newMiddlewares(ctx, 5)...)
+	tgc.RunWithAuth(ctx, client, "", func(ctx context.Context) error {
 		_, err := client.API().AuthLogOut(ctx)
 		return err
 	})
 	a.db.Where("hash = ?", authUser.Hash).Delete(&models.Session{})
-	_ = a.cache.Delete(cache.Key("sessions", authUser.Hash), cache.Key("users", "sessions", authUser.ID))
+	userId, _ := strconv.ParseInt(authUser.Subject, 10, 64)
+	a.cache.Delete(ctx, cache.KeySessionHash(authUser.Hash), cache.KeyUserSessions(userId))
 	return &api.AuthLogoutNoContent{SetCookie: setCookie(authCookieName, "", -1)}, nil
 }
 
@@ -144,7 +145,7 @@ func (a *apiService) AuthSession(ctx context.Context, params api.AuthSessionPara
 	if params.AccessToken.Value == "" {
 		return &api.AuthSessionNoContent{}, nil
 	}
-	claims, err := auth.VerifyUser(a.db, a.cache, a.cnf.JWT.Secret, params.AccessToken.Value)
+	claims, err := auth.VerifyUser(ctx, a.db, a.cache, a.cnf.JWT.Secret, params.AccessToken.Value)
 
 	if err != nil {
 		return &api.AuthSessionNoContent{}, nil
@@ -191,17 +192,20 @@ func (e *extendedService) AuthWs(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	logger := logging.FromContext(ctx)
+	logger := logging.Component("AUTH").With(
+		zap.String("remote_addr", r.RemoteAddr),
+		zap.String("auth_method", "qr"),
+	)
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		logger.Error("websocket upgrade error", zap.Error(err))
+		logger.Error("websocket.upgrade_failed", zap.Error(err))
 		http.Error(w, "could not upgrade connection", http.StatusBadRequest)
 		return
 	}
 
 	defer func() {
 		if err := conn.Close(); err != nil {
-			logger.Error("error closing websocket connection", zap.Error(err))
+			logger.Error("websocket.close_failed", zap.Error(err))
 		}
 	}()
 
@@ -210,7 +214,7 @@ func (e *extendedService) AuthWs(w http.ResponseWriter, r *http.Request) {
 	sessionStorage := &session.StorageMemory{}
 	tgClient, err := tgc.NoAuthClient(ctx, &e.api.cnf.TG, dispatcher, sessionStorage)
 	if err != nil {
-		logger.Error("error creating telegram client", zap.Error(err))
+		logger.Error("telegram.client_create_failed", zap.Error(err))
 		return
 	}
 
@@ -239,14 +243,14 @@ func (e *extendedService) AuthWs(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if err != nil {
-		logger.Error("error running telegram client", zap.Error(err))
+		logger.Error("telegram.client_run_failed", zap.Error(err))
 		return
 	}
 }
 
 func (e *extendedService) handleQRAuth(ctx context.Context, conn *websocket.Conn, tgClient *telegram.Client, loggedIn qrlogin.LoggedIn, sessionStorage session.Storage, logger *zap.Logger) {
 	authorization, err := tgClient.QR().Auth(ctx, loggedIn, func(ctx context.Context, token qrlogin.Token) error {
-		_ = conn.WriteJSON(map[string]any{"type": "auth", "payload": map[string]string{"token": token.URL()}})
+		conn.WriteJSON(map[string]any{"type": "auth", "payload": map[string]string{"token": token.URL()}})
 		return nil
 	})
 
@@ -254,30 +258,30 @@ func (e *extendedService) handleQRAuth(ctx context.Context, conn *websocket.Conn
 		return
 	}
 	if tgerr.Is(err, "SESSION_PASSWORD_NEEDED") {
-		_ = conn.WriteJSON(map[string]any{"type": "auth", "message": "2FA required"})
+		conn.WriteJSON(map[string]any{"type": "auth", "message": "2FA required"})
 		return
 	}
 
 	if err != nil {
-		logger.Error("QR auth error", zap.Error(err))
-		_ = conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
+		logger.Error("auth.qr_login_failed", zap.Error(err))
+		conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
 		return
 	}
 	user, ok := authorization.User.AsNotEmpty()
 	if !ok {
-		_ = conn.WriteJSON(map[string]any{"type": "error", "message": "auth failed"})
+		conn.WriteJSON(map[string]any{"type": "error", "message": "auth failed"})
 		return
 	}
 	if !checkUserIsAllowed(e.api.cnf.JWT.AllowedUsers, user.Username) {
-		_ = conn.WriteJSON(map[string]any{"type": "error", "message": "user not allowed"})
+		conn.WriteJSON(map[string]any{"type": "error", "message": "user not allowed"})
 		_, _ = tgClient.API().AuthLogOut(ctx)
 		return
 	}
 	res, _ := sessionStorage.LoadSession(ctx)
 	sessionData := &types.SessionData{}
-	_ = json.Unmarshal(res, sessionData)
+	json.Unmarshal(res, sessionData)
 	session := prepareSession(user, &sessionData.Data)
-	_ = conn.WriteJSON(map[string]any{"type": "auth", "payload": session, "message": "success"})
+	conn.WriteJSON(map[string]any{"type": "auth", "payload": session, "message": "success"})
 }
 
 func (e *extendedService) handlePhoneAuth(ctx context.Context, conn *websocket.Conn, tgClient *telegram.Client, message *types.SocketMessage, sessionStorage session.Storage, logger *zap.Logger) {
@@ -289,46 +293,46 @@ func (e *extendedService) handlePhoneAuth(ctx context.Context, conn *websocket.C
 		}
 
 		if err != nil {
-			logger.Error("error sending code", zap.Error(err))
-			_ = conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
+			logger.Error("auth.phone_code_failed", zap.Error(err), zap.String("phone", message.PhoneNo))
+			conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
 			return
 		}
 		code := res.(*tg.AuthSentCode)
-		_ = conn.WriteJSON(map[string]any{"type": "auth", "payload": map[string]string{"phoneCodeHash": code.PhoneCodeHash}})
+		conn.WriteJSON(map[string]any{"type": "auth", "payload": map[string]string{"phoneCodeHash": code.PhoneCodeHash}})
 	case "signin":
 		auth, err := tgClient.Auth().SignIn(ctx, message.PhoneNo, message.PhoneCode, message.PhoneCodeHash)
 		if errors.Is(err, context.Canceled) {
 			return
 		}
 		if errors.Is(err, tgauth.ErrPasswordAuthNeeded) {
-			_ = conn.WriteJSON(map[string]any{"type": "auth",
+			conn.WriteJSON(map[string]any{"type": "auth",
 				"message": tgauth.ErrPasswordAuthNeeded.Error()})
 			return
 		}
 		if tgerr.Is(err, "PHONE_CODE_INVALID") {
-			_ = conn.WriteJSON(map[string]any{"type": "auth", "message": "PHONE_CODE_INVALID"})
+			conn.WriteJSON(map[string]any{"type": "auth", "message": "PHONE_CODE_INVALID"})
 			return
 		}
 		if err != nil {
-			logger.Error("phone sign-in error", zap.Error(err))
-			_ = conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
+			logger.Error("auth.phone_signin_failed", zap.Error(err), zap.String("phone", message.PhoneNo))
+			conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
 			return
 		}
 		user, ok := auth.User.AsNotEmpty()
 		if !ok {
-			_ = conn.WriteJSON(map[string]any{"type": "error", "message": "auth failed"})
+			conn.WriteJSON(map[string]any{"type": "error", "message": "auth failed"})
 			return
 		}
 		if !checkUserIsAllowed(e.api.cnf.JWT.AllowedUsers, user.Username) {
-			_ = conn.WriteJSON(map[string]any{"type": "error", "message": "user not allowed"})
+			conn.WriteJSON(map[string]any{"type": "error", "message": "user not allowed"})
 			_, _ = tgClient.API().AuthLogOut(ctx)
 			return
 		}
 		res, _ := sessionStorage.LoadSession(ctx)
 		sessionData := &types.SessionData{}
-		_ = json.Unmarshal(res, sessionData)
+		json.Unmarshal(res, sessionData)
 		session := prepareSession(user, &sessionData.Data)
-		_ = conn.WriteJSON(map[string]any{"type": "auth", "payload": session, "message": "success"})
+		conn.WriteJSON(map[string]any{"type": "auth", "payload": session, "message": "success"})
 	}
 }
 
@@ -338,25 +342,25 @@ func (e *extendedService) handle2FAAuth(ctx context.Context, conn *websocket.Con
 		return
 	}
 	if err != nil {
-		logger.Error("phone sign-in error", zap.Error(err))
-		_ = conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
+		logger.Error("auth.2fa_failed", zap.Error(err))
+		conn.WriteJSON(map[string]any{"type": "error", "message": err.Error()})
 		return
 	}
 	user, ok := auth.User.AsNotEmpty()
 	if !ok {
-		_ = conn.WriteJSON(map[string]any{"type": "error", "message": "auth failed"})
+		conn.WriteJSON(map[string]any{"type": "error", "message": "auth failed"})
 		return
 	}
 	if !checkUserIsAllowed(e.api.cnf.JWT.AllowedUsers, user.Username) {
-		_ = conn.WriteJSON(map[string]any{"type": "error", "message": "user not allowed"})
+		conn.WriteJSON(map[string]any{"type": "error", "message": "user not allowed"})
 		_, _ = tgClient.API().AuthLogOut(ctx)
 		return
 	}
 	res, _ := sessionStorage.LoadSession(ctx)
 	sessionData := &types.SessionData{}
-	_ = json.Unmarshal(res, sessionData)
+	json.Unmarshal(res, sessionData)
 	session := prepareSession(user, &sessionData.Data)
-	_ = conn.WriteJSON(map[string]any{"type": "auth", "payload": session, "message": "success"})
+	conn.WriteJSON(map[string]any{"type": "auth", "payload": session, "message": "success"})
 }
 
 func ip4toInt(ipv4Address net.IP) int64 {
@@ -369,7 +373,7 @@ func pack32BinaryIP4(ip4Address string) []byte {
 	ipv4Decimal := ip4toInt(net.ParseIP(ip4Address))
 
 	buf := new(bytes.Buffer)
-	_ = binary.Write(buf, binary.BigEndian, uint32(ipv4Decimal))
+	binary.Write(buf, binary.BigEndian, uint32(ipv4Decimal))
 	return buf.Bytes()
 }
 

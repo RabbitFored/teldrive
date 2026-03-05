@@ -73,7 +73,7 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 	}
 
 	if err != nil {
-		logging.FromContext(ctx).Error("create invoker", zap.Error(err))
+		logging.Component("POOL").Error("invoker.create_failed", zap.Error(err))
 		return p.api
 	}
 
@@ -88,10 +88,12 @@ func (p *pool) Default(ctx context.Context) *tg.Client {
 }
 
 func (p *pool) Close() error {
-
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.close != nil {
-		return p.close()
+		err := p.close()
+		p.close = nil
+		return err
 	}
-
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -22,119 +23,200 @@ import (
 	"github.com/tgdrive/teldrive/internal/duration"
 )
 
+var (
+	matchFirstCap = regexp.MustCompile("(.)([A-Z][a-z]+)")
+	matchAllCap   = regexp.MustCompile("([a-z0-9])([A-Z])")
+)
+
+func toKebabCase(str string) string {
+	snake := matchFirstCap.ReplaceAllString(str, "${1}-${2}")
+	snake = matchAllCap.ReplaceAllString(snake, "${1}-${2}")
+	return strings.ToLower(snake)
+}
+
+func getKey(f reflect.StructField) string {
+	if t := f.Tag.Get("koanf"); t != "" {
+		return t
+	}
+	return toKebabCase(f.Name)
+}
+
+type EventConfig struct {
+	PollInterval     time.Duration `default:"10s" description:"Event polling interval for single-instance mode"`
+	DBWorkers        int           `default:"10" description:"Number of DB worker goroutines for event persistence"`
+	DBBufferSize     int           `default:"1000" description:"Size of DB worker queue buffer"`
+	DeduplicationTTL time.Duration `default:"5s" description:"Event deduplication time-to-live"`
+}
+
 type ServerCmdConfig struct {
-	Server   ServerConfig  `koanf:"server"`
-	Log      LoggingConfig `koanf:"log"`
-	JWT      JWTConfig     `koanf:"jwt"`
-	DB       DBConfig      `koanf:"db"`
-	TG       TGConfig      `koanf:"tg"`
-	CronJobs CronJobConfig `koanf:"cronjobs"`
-	Cache    CacheConfig   `koanf:"cache"`
+	Server   ServerConfig
+	Log      LoggingConfig
+	JWT      JWTConfig
+	DB       DBConfig
+	TG       TGConfig
+	CronJobs CronJobConfig
+	Cache    CacheConfig
+	Redis    RedisConfig
+	Events   EventConfig
 }
 
 type CheckCmdConfig struct {
-	Log          LoggingConfig `koanf:"log" skipPflag:"true"`
-	DB           DBConfig      `koanf:"db" skipPflag:"true"`
-	TG           TGConfig      `koanf:"tg" skipPflag:"true"`
-	ExportFile   string        `koanf:"export-file" default:"results.json" description:"Path for exported JSON file"`
-	DryRun       bool          `koanf:"dry-run" default:"false" description:"Simulate check/clean process without making changes"`
-	User         string        `koanf:"user" default:"" description:"Telegram username to check (prompts if not specified)"`
-	Concurrent   int           `koanf:"concurrent" default:"4" description:"Number of concurrent channel processing"`
-	CleanUploads bool          `koanf:"clean-uploads" default:"false" description:"Clean incomplete uploads"`
-	CleanPending bool          `koanf:"clean-pending" default:"false" description:"Clean files with pending_deletion status"`
+	Log          LoggingConfig `skipPflag:"true"`
+	DB           DBConfig      `skipPflag:"true"`
+	TG           TGConfig      `skipPflag:"true"`
+	ExportFile   string        `default:"results.json" description:"Path for exported JSON file"`
+	DryRun       bool          `default:"false" description:"Simulate check/clean process without making changes"`
+	User         string        `default:"" description:"Telegram username to check (prompts if not specified)"`
+	Concurrent   int           `default:"4" description:"Number of concurrent channel processing"`
+	CleanUploads bool          `default:"false" description:"Clean incomplete uploads"`
+	CleanPending bool          `default:"false" description:"Clean files with pending_deletion status"`
 }
 
 type ServerConfig struct {
-	Port             int           `koanf:"port" default:"8080" description:"HTTP port for the server to listen on"`
-	GracefulShutdown time.Duration `koanf:"graceful-shutdown" default:"10s" description:"Grace period for server shutdown"`
-	EnablePprof      bool          `koanf:"enable-pprof" default:"false" description:"Enable pprof debugging endpoints"`
-	ReadTimeout      time.Duration `koanf:"read-timeout" default:"1h" description:"Maximum duration for reading entire request"`
-	WriteTimeout     time.Duration `koanf:"write-timeout" default:"1h" description:"Maximum duration for writing response"`
+	Port             int           `default:"8080" description:"HTTP port for the server to listen on"`
+	GracefulShutdown time.Duration `default:"10s" description:"Grace period for server shutdown"`
+	EnablePprof      bool          `default:"false" description:"Enable pprof debugging endpoints"`
+	ReadTimeout      time.Duration `default:"1h" description:"Maximum duration for reading entire request"`
+	WriteTimeout     time.Duration `default:"1h" description:"Maximum duration for writing response"`
 }
 
 type CacheConfig struct {
-	MaxSize   int    `koanf:"max-size" default:"10485760" description:"Maximum cache size in bytes"`
-	RedisAddr string `koanf:"redis-addr" default:"" description:"Redis server address"`
-	RedisPass string `koanf:"redis-pass" default:"" description:"Redis server password"`
+	MaxSize int `default:"10485760" description:"Maximum cache size in bytes (used for memory cache)"`
+}
+
+type RedisConfig struct {
+	Addr            string        `default:"" description:"Redis server address (empty to disable Redis)"`
+	Password        string        `default:"" description:"Redis server password"`
+	PoolSize        int           `default:"10" description:"Redis connection pool size"`
+	MinIdleConns    int           `default:"5" description:"Redis minimum idle connections"`
+	MaxIdleConns    int           `default:"10" description:"Redis maximum idle connections"`
+	ConnMaxIdleTime time.Duration `default:"5m" description:"Redis connection maximum idle time"`
+	ConnMaxLifetime time.Duration `default:"1h" description:"Redis connection maximum lifetime"`
+}
+
+// HTTPLoggingConfig holds HTTP request logging configuration
+type HTTPLoggingConfig struct {
+	Enabled            bool     `default:"true" description:"Enable HTTP request logging"`
+	LogQueries         bool     `default:"false" description:"Log full query strings (use with caution)"`
+	SanitizeQueries    bool     `default:"true" description:"Remove sensitive params from query preview"`
+	MaxQueryLength     int      `default:"100" description:"Maximum length of query preview"`
+	LogUserAgent       bool     `default:"true" description:"Log user agent (truncated)"`
+	LogRequestBodySize bool     `default:"true" description:"Log request Content-Length"`
+	LogResponseSize    bool     `default:"true" description:"Log response bytes written"`
+	SkipPaths          []string `default:"/health,/metrics" description:"Paths to skip from logging"`
+}
+
+// DBLoggingConfig holds database query logging configuration
+type DBLoggingConfig struct {
+	Level                string        `default:"error" description:"Database logging level (silent, error, warn, info, debug)"`
+	SlowThreshold        time.Duration `default:"1s" description:"Log queries slower than this threshold"`
+	IgnoreRecordNotFound bool          `default:"true" description:"Don't log 'record not found' errors"`
+	LogSQL               bool          `default:"true" description:"LogSQL"`
+}
+
+// TGLoggingConfig holds Telegram client logging configuration
+type TGLoggingConfig struct {
+	Enabled bool   `default:"false" description:"Enable Telegram client internal logging"`
+	Level   string `default:"warn" description:"Telegram client logging level (debug, info, warn, error)"`
 }
 
 type LoggingConfig struct {
-	Level string `koanf:"level" default:"info" description:"Logging level (debug, info, warn, error)"`
-	File  string `koanf:"file" default:"" description:"Log file path, if empty logs to stdout"`
+	Level      string `default:"info" description:"Global logging level (debug, info, warn, error)"`
+	TimeFormat string `default:"2006-01-02 15:04:05" description:"Log time format"`
+	File       string `default:"" description:"Log file path, if empty logs to stdout only"`
+	HTTP       HTTPLoggingConfig
+	DB         DBLoggingConfig
+	TG         TGLoggingConfig
 }
 
 type JWTConfig struct {
-	Secret       string        `validate:"required" koanf:"secret" default:"" description:"JWT signing secret key"`
-	SessionTime  time.Duration `koanf:"session-time" default:"30d" description:"JWT token validity duration"`
-	AllowedUsers []string      `koanf:"allowed-users" default:"" description:"List of allowed usernames"`
+	Secret       string        `validate:"required" default:"" description:"JWT signing secret key"`
+	SessionTime  time.Duration `default:"30d" description:"JWT token validity duration"`
+	AllowedUsers []string      `default:"" description:"List of allowed usernames"`
 }
 
 type DBPool struct {
-	Enable             bool          `koanf:"enable" default:"true" description:"Enable connection pooling"`
-	MaxOpenConnections int           `koanf:"max-open-connections" default:"25" description:"Maximum number of open connections"`
-	MaxIdleConnections int           `koanf:"max-idle-connections" default:"25" description:"Maximum number of idle connections"`
-	MaxLifetime        time.Duration `koanf:"max-lifetime" default:"10m" description:"Maximum connection lifetime"`
+	Enable             bool          `default:"true" description:"Enable connection pooling"`
+	MaxOpenConnections int           `default:"25" description:"Maximum number of open connections"`
+	MaxIdleConnections int           `default:"25" description:"Maximum number of idle connections"`
+	MaxLifetime        time.Duration `default:"10m" description:"Maximum connection lifetime"`
 }
 type DBConfig struct {
-	DataSource  string `validate:"required" koanf:"data-source" default:"" description:"Database connection string"`
-	PrepareStmt bool   `koanf:"prepare-stmt" default:"true" description:"Use prepared statements"`
-	LogLevel    string `koanf:"log-level" default:"error" description:"Database logging level"`
-	Pool        DBPool `koanf:"pool"`
+	DataSource  string `validate:"required" default:"" description:"Database connection string"`
+	PrepareStmt bool   `default:"true" description:"Use prepared statements"`
+	Pool        DBPool
 }
 
 type CronJobConfig struct {
-	Enable               bool          `koanf:"enable" default:"true" description:"Enable scheduled background jobs"`
-	LockerInstance       string        `koanf:"locker-instance" default:"cron-locker" description:"Distributed unique cron locker name"`
-	CleanFilesInterval   time.Duration `koanf:"clean-files-interval" default:"1h" description:"Interval for cleaning expired files"`
-	CleanUploadsInterval time.Duration `koanf:"clean-uploads-interval" default:"12h" description:"Interval for cleaning incomplete uploads"`
-	FolderSizeInterval   time.Duration `koanf:"folder-size-interval" default:"2h" description:"Interval for updating folder sizes"`
+	Enable               bool          `default:"true" description:"Enable scheduled background jobs"`
+	LockerInstance       string        `default:"cron-locker" description:"Distributed unique cron locker name"`
+	CleanFilesInterval   time.Duration `default:"1h" description:"Interval for cleaning expired files"`
+	CleanUploadsInterval time.Duration `default:"12h" description:"Interval for cleaning incomplete uploads"`
+	FolderSizeInterval   time.Duration `default:"2h" description:"Interval for updating folder sizes"`
 }
 
 type TGStream struct {
-	Concurrency  int           `koanf:"concurrency" default:"1" description:"Number of concurrent threads for concurrent reader"`
-	Buffers      int           `koanf:"buffers" default:"8" description:"Number of stream buffers"`
-	ChunkTimeout time.Duration `koanf:"chunk-timeout" default:"30s" description:"Chunk download timeout"`
+	Concurrency  int           `default:"1" description:"Number of concurrent threads for concurrent reader"`
+	Buffers      int           `default:"8" description:"Number of stream buffers"`
+	ChunkTimeout time.Duration `default:"30s" description:"Chunk download timeout"`
+	BotsLimit    int           `default:"0" description:"Maximum number of bots for streaming (0 = use all bots)"`
 }
 
 type TGUpload struct {
-	EncryptionKey string        `koanf:"encryption-key" default:"" description:"Encryption key for uploads"`
-	Threads       int           `koanf:"threads" default:"8" description:"Number of upload threads"`
-	MaxRetries    int           `koanf:"max-retries" default:"10" description:"Maximum upload retry attempts"`
-	Retention     time.Duration `koanf:"retention" default:"7d" description:"Upload retention period"`
+	EncryptionKey string        `default:"" description:"Encryption key for uploads"`
+	Threads       int           `default:"8" description:"Number of upload threads"`
+	MaxRetries    int           `default:"10" description:"Maximum upload retry attempts"`
+	Retention     time.Duration `default:"7d" description:"Upload retention period"`
 }
 type TGConfig struct {
-	RateLimit         bool          `koanf:"rate-limit" default:"true" description:"Enable rate limiting for API calls"`
-	RateBurst         int           `koanf:"rate-burst" default:"5" description:"Maximum burst size for rate limiting"`
-	Rate              int           `koanf:"rate" default:"100" description:"Rate limit in requests per minute"`
-	Ntp               bool          `koanf:"ntp" default:"false" description:"Use NTP for time synchronization"`
-	Proxy             string        `koanf:"proxy" default:"" description:"HTTP/SOCKS5 proxy URL"`
-	ReconnectTimeout  time.Duration `koanf:"reconnect-timeout" default:"5m" description:"Client reconnection timeout"`
-	PoolSize          int           `koanf:"pool-size" default:"8" description:"Session pool size"`
-	EnableLogging     bool          `koanf:"enable-logging" default:"false" description:"Enable Telegram client logging"`
-	AppId             int           `koanf:"app-id" default:"2496" description:"Telegram app ID"`
-	AppHash           string        `koanf:"app-hash" default:"8da85b0d5bfe62527e5b244c209159c3" description:"Telegram app hash"`
-	DeviceModel       string        `koanf:"device-model" default:"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/116.0" description:"Device model"`
-	SystemVersion     string        `koanf:"system-version" default:"Win32" description:"System version"`
-	AppVersion        string        `koanf:"app-version" default:"6.1.4 K" description:"App version"`
-	LangCode          string        `koanf:"lang-code" default:"en" description:"Language code"`
-	SystemLangCode    string        `koanf:"system-lang-code" default:"en-US" description:"System language code"`
-	LangPack          string        `koanf:"lang-pack" default:"webk" description:"Language pack"`
-	SessionInstance   string        `koanf:"session-instance" default:"teldrive" description:"Bot Sessions Instance Name"`
-	AutoChannelCreate bool          `koanf:"auto-channel-create" default:"true" description:"Auto Create Channel"`
-	ChannelLimit      int64         `koanf:"channel-limit" default:"500000" description:"Channel message limit before auto channel creation"`
-	Uploads           TGUpload      `koanf:"uploads"`
-	Stream            TGStream      `koanf:"stream"`
+	RateLimit         bool          `default:"true" description:"Enable rate limiting for API calls"`
+	RateBurst         int           `default:"5" description:"Maximum burst size for rate limiting"`
+	Rate              int           `default:"100" description:"Rate limit in requests per minute"`
+	Ntp               bool          `default:"false" description:"Use NTP for time synchronization"`
+	Proxy             string        `default:"" description:"HTTP/SOCKS5 proxy URL"`
+	ReconnectTimeout  time.Duration `default:"5m" description:"Client reconnection timeout"`
+	PoolSize          int           `default:"8" description:"Session pool size"`
+	EnableLogging     bool          `default:"false" description:"Enable Telegram client logging (deprecated: use logging.tg.enabled instead)"`
+	AppId             int           `default:"2496" description:"Telegram app ID"`
+	AppHash           string        `default:"8da85b0d5bfe62527e5b244c209159c3" description:"Telegram app hash"`
+	DeviceModel       string        `default:"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/116.0" description:"Device model"`
+	SystemVersion     string        `default:"Win32" description:"System version"`
+	AppVersion        string        `default:"6.1.4 K" description:"App version"`
+	LangCode          string        `default:"en" description:"Language code"`
+	SystemLangCode    string        `default:"en-US" description:"System language code"`
+	LangPack          string        `default:"webk" description:"Language pack"`
+	SessionInstance   string        `default:"teldrive" description:"Bot session instance name for multi-instance deployments"`
+	AutoChannelCreate bool          `default:"true" description:"Auto Create Channel"`
+	ChannelLimit      int64         `default:"500000" description:"Channel message limit before auto channel creation"`
+	Uploads           TGUpload
+	Stream            TGStream
+	// Session storage configuration for Telegram sessions
+	Session SessionStorageConfig
+}
+
+type BoltSessionConfig struct {
+	Path       string        `default:"" description:"Path to BoltDB session file (empty for auto-detect)"`
+	Timeout    time.Duration `default:"1s" description:"Timeout for opening BoltDB"`
+	NoGrowSync bool          `default:"false" description:"Disable grow sync for performance"`
+}
+
+type SessionStorageConfig struct {
+	Type string            `default:"postgres" description:"Session storage type: postgres, bolt, memory"`
+	Key  string            `default:"session" description:"Key prefix for session storage"`
+	Bolt BoltSessionConfig `koanf:"bolt"`
 }
 
 type ConfigLoader struct {
 	k       *koanf.Koanf
 	flagMap map[string]string
+	envMap  map[string]string
 }
 
 func NewConfigLoader() *ConfigLoader {
 	return &ConfigLoader{
 		k:       koanf.New("."),
 		flagMap: make(map[string]string),
+		envMap:  make(map[string]string),
 	}
 }
 
@@ -221,12 +303,12 @@ func (cl *ConfigLoader) Load(cmd *cobra.Command, cfg any) error {
 	// 2. Load config file
 	if cfgFile != "" {
 		if err := cl.k.Load(file.Provider(cfgFile), parser); err != nil {
-			return fmt.Errorf("error reading config file: %v", err)
+			return fmt.Errorf("error reading config file: %w", err)
 		}
 	} else {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return fmt.Errorf("error getting home directory: %v", err)
+			return fmt.Errorf("error getting home directory: %w", err)
 		}
 		paths := []string{
 			filepath.Join(home, ".teldrive", "config.toml"),
@@ -235,7 +317,7 @@ func (cl *ConfigLoader) Load(cmd *cobra.Command, cfg any) error {
 		for _, path := range paths {
 			if _, err := os.Stat(path); err == nil {
 				if err := cl.k.Load(file.Provider(path), toml.Parser()); err != nil {
-					return fmt.Errorf("error reading config file: %v", err)
+					return fmt.Errorf("error reading config file: %w", err)
 				}
 				break
 			}
@@ -243,12 +325,19 @@ func (cl *ConfigLoader) Load(cmd *cobra.Command, cfg any) error {
 	}
 
 	// 3. Load environment variables
+	cl.generateEnvMap(reflect.TypeOf(cfg), "", "")
+
 	if err := cl.k.Load(&unflattenProvider{
 		p: env.Provider("TELDRIVE_", ".", func(s string) string {
-			return strings.ReplaceAll(strings.ToLower(strings.TrimPrefix(s, "TELDRIVE_")), "_", ".")
+			key := strings.TrimPrefix(s, "TELDRIVE_")
+			if val, ok := cl.envMap[key]; ok {
+				return val
+			}
+			return strings.ReplaceAll(strings.ToLower(key), "_", "-")
 		}),
 		delim: ".",
 	}, nil); err != nil {
+
 		return err
 	}
 
@@ -260,15 +349,22 @@ func (cl *ConfigLoader) Load(cmd *cobra.Command, cfg any) error {
 	unmarshalCfg := koanf.UnmarshalConf{
 		Tag: "koanf",
 		DecoderConfig: &mapstructure.DecoderConfig{
-			DecodeHook: func(f reflect.Type, t reflect.Type, data any) (any, error) {
-				if f.Kind() != reflect.String {
-					return data, nil
-				}
-				if t != reflect.TypeFor[time.Duration]() {
-					return data, nil
-				}
-				return duration.ParseDuration(data.(string))
+			MatchName: func(mapKey, fieldName string) bool {
+				return strings.EqualFold(strings.ReplaceAll(mapKey, "-", ""), strings.ReplaceAll(fieldName, "-", "")) ||
+					strings.EqualFold(strings.ReplaceAll(mapKey, "_", ""), strings.ReplaceAll(fieldName, "_", ""))
 			},
+			DecodeHook: mapstructure.ComposeDecodeHookFunc(
+				mapstructure.StringToSliceHookFunc(","),
+				func(f reflect.Type, t reflect.Type, data any) (any, error) {
+					if f.Kind() != reflect.String {
+						return data, nil
+					}
+					if t != reflect.TypeFor[time.Duration]() {
+						return data, nil
+					}
+					return duration.ParseDuration(data.(string))
+				},
+			),
 			Result:           cfg,
 			WeaklyTypedInput: true,
 		},
@@ -291,8 +387,8 @@ func (cl *ConfigLoader) RegisterFlags(flags *pflag.FlagSet, t reflect.Type) {
 	cl.registerStruct(flags, "", t)
 }
 
-func (cl *ConfigLoader) loadSkippedDefaults(t reflect.Type, prefix string) {
-	if t.Kind() == reflect.Ptr {
+func (cl *ConfigLoader) generateEnvMap(t reflect.Type, prefix string, envPrefix string) {
+	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t.Kind() != reflect.Struct {
@@ -301,10 +397,37 @@ func (cl *ConfigLoader) loadSkippedDefaults(t reflect.Type, prefix string) {
 
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
-		koanfTag := field.Tag.Get("koanf")
-		if koanfTag == "" {
-			continue
+		koanfTag := getKey(field)
+
+		key := koanfTag
+		if prefix != "" {
+			key = prefix + "." + koanfTag
 		}
+
+		envKey := strings.ToUpper(strings.ReplaceAll(koanfTag, "-", "_"))
+		if envPrefix != "" {
+			envKey = envPrefix + "_" + envKey
+		}
+
+		if field.Type.Kind() == reflect.Struct && field.Type != reflect.TypeFor[time.Duration]() {
+			cl.generateEnvMap(field.Type, key, envKey)
+		} else {
+			cl.envMap[envKey] = key
+		}
+	}
+}
+
+func (cl *ConfigLoader) loadSkippedDefaults(t reflect.Type, prefix string) {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return
+	}
+
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		koanfTag := getKey(field)
 
 		key := koanfTag
 		if prefix != "" {
@@ -323,7 +446,7 @@ func (cl *ConfigLoader) loadSkippedDefaults(t reflect.Type, prefix string) {
 }
 
 func (cl *ConfigLoader) registerDefaultsRecursive(t reflect.Type, prefix string) {
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t.Kind() != reflect.Struct {
@@ -332,10 +455,7 @@ func (cl *ConfigLoader) registerDefaultsRecursive(t reflect.Type, prefix string)
 
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
-		koanfTag := field.Tag.Get("koanf")
-		if koanfTag == "" {
-			continue
-		}
+		koanfTag := getKey(field)
 
 		key := prefix + "." + koanfTag
 
@@ -369,11 +489,7 @@ func (cl *ConfigLoader) registerDefaultsRecursive(t reflect.Type, prefix string)
 func (cl *ConfigLoader) registerStruct(flags *pflag.FlagSet, prefix string, t reflect.Type) {
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
-		koanfTag := field.Tag.Get("koanf")
-
-		if koanfTag == "" {
-			continue
-		}
+		koanfTag := getKey(field)
 
 		key := koanfTag
 		if prefix != "" {
