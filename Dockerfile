@@ -49,7 +49,7 @@ prepare-stmt = false\n\
 \n\
 [jwt]\n\
 secret = "${JWT_SECRET}"\n\
-allowed-users = "${ALLOWED_USER}"\n\
+allowed-users = [ "${FORMATTED_USERS}" ]\n\
 \n\
 [tg.uploads]\n\
 encryption-key = "${ENCRYPTION_KEY}"\n\
@@ -57,6 +57,7 @@ encryption-key = "${ENCRYPTION_KEY}"\n\
 
 # Create Startup Script
 RUN echo '#!/bin/sh\n\
+export FORMATTED_USERS=$(echo "$ALLOWED_USER" | sed "s/ *, */\",\"/g")\n\
 envsubst < /app/config.toml.template > /app/config.toml\n\
 /app/teldrive run\n\
 ' > /app/run.sh && chmod +x /app/run.sh
